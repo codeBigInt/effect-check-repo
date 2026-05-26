@@ -1,0 +1,5 @@
+dist
+node_modules
+src/managed
+.env
+.DS_Store

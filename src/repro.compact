@@ -1,0 +1,216 @@
+pragma language_version 0.23.0;
+import CompactStandardLibrary;
+
+export ledger protocolTVL: Map<Bytes<32>, QualifiedShieldedCoinInfo>;
+export ledger pendingDeposits: Map<Bytes<32>, Uint<128>>;
+export ledger suppliedBalances: Map<Bytes<32>, Uint<128>>;
+export ledger supplyIndexes: Map<Bytes<32>, Uint<64>>;
+export ledger borrowedBalances: Map<Bytes<32>, Uint<128>>;
+export ledger supplyCommitments: HistoricMerkleTree<32, Bytes<32>>;
+export ledger underlyingColor: Bytes<32>;
+export ledger fTokenColor: Bytes<32>;
+export ledger mintCounter: Counter;
+
+export struct SupplyCommitment {
+    ownerKey: Bytes<32>;
+    coinColor: Bytes<32>;
+    amount: Uint<128>;
+}
+
+export {
+    ShieldedCoinInfo,
+    QualifiedShieldedCoinInfo
+};
+
+circuit accountKey(): Bytes<32> {
+    return persistentHash<Vector<2, Bytes<32>>>([
+        pad(32, "effects-check-repro:account"),
+        ownPublicKey().bytes
+    ]);
+}
+
+circuit pendingKey(coinColor: Bytes<32>): Bytes<32> {
+    return persistentHash<Vector<2, Bytes<32>>>([
+        accountKey(),
+        coinColor
+    ]);
+}
+
+circuit supplyCommitment(coinColor: Bytes<32>, amount: Uint<128>): Bytes<32> {
+    return persistentCommit<SupplyCommitment>(
+        SupplyCommitment {
+            ownerKey: accountKey(),
+            coinColor: coinColor,
+            amount: amount
+        },
+        accountKey()
+    );
+}
+
+circuit fTokenDomain(coinColor: Bytes<32>): Bytes<32> {
+    return persistentHash<Vector<2, Bytes<32>>>([
+        pad(32, "effects-check-repro:ftoken"),
+        coinColor
+    ]);
+}
+
+circuit mintNonce(): Bytes<32> {
+    return persistentHash<Vector<2, Bytes<32>>>([
+        pad(32, "effects-check-repro:mint"),
+        mintCounter.read() as Bytes<32>
+    ]);
+}
+
+circuit receiveIntoProtocolTVL(disclosedCoin: ShieldedCoinInfo): [] {
+    receiveShielded(disclosedCoin);
+
+    const coinToInsert = protocolTVL.member(disclosedCoin.color)
+    ? mergeCoinImmediate(protocolTVL.lookup(disclosedCoin.color), disclosedCoin)
+    : disclosedCoin;
+
+    protocolTVL.insertCoin(
+        disclosedCoin.color,
+        coinToInsert,
+        right<ZswapCoinPublicKey, ContractAddress>(kernel.self())
+    );
+}
+
+circuit sendFromProtocolTVL(
+    coinColor: Bytes<32>,
+    receiverAddress: ZswapCoinPublicKey,
+    amountToSend: Uint<128>
+): [] {
+    assert(protocolTVL.member(coinColor), "Missing protocol TVL coin");
+    assert(amountToSend > 0, "Invalid send amount");
+
+    const protocolCoin = protocolTVL.lookup(coinColor);
+    const sendResult = sendShielded(
+        protocolCoin,
+        left<ZswapCoinPublicKey, ContractAddress>(receiverAddress),
+        amountToSend
+    );
+
+    if (sendResult.change.is_some) {
+        protocolTVL.insertCoin(
+            coinColor,
+            sendResult.change.value,
+            right<ZswapCoinPublicKey, ContractAddress>(kernel.self())
+        );
+    } else {
+        protocolTVL.remove(coinColor);
+    }
+}
+
+export circuit setupPool(coinColor_: Bytes<32>): [] {
+    const coinColor = disclose(coinColor_);
+    underlyingColor = coinColor;
+    fTokenColor = tokenType(fTokenDomain(coinColor), kernel.self());
+}
+
+export circuit depositLiquidity(principalCoin_: ShieldedCoinInfo): [] {
+    const disclosedCoin = disclose(principalCoin_);
+    const depositAmount = disclosedCoin.value;
+    const coinColor = disclosedCoin.color;
+
+    assert(coinColor == underlyingColor, "Unexpected deposit coin color");
+    assert(depositAmount > 0, "Invalid deposit amount");
+
+    receiveIntoProtocolTVL(disclosedCoin);
+
+    const key = pendingKey(coinColor);
+    const previousAmount = pendingDeposits.member(key)
+    ? pendingDeposits.lookup(key)
+    : 0;
+    pendingDeposits.insert(key, (previousAmount + depositAmount) as Uint<128>);
+}
+
+export circuit claimLpTokens(coinColor_: Bytes<32>, claimAmount_: Uint<64>): [] {
+    const coinColor = disclose(coinColor_);
+    const claimAmount = disclose(claimAmount_);
+    const key = pendingKey(coinColor);
+
+    assert(coinColor == underlyingColor, "Unexpected claim coin color");
+    assert(pendingDeposits.member(key), "No pending deposit");
+    assert(pendingDeposits.lookup(key) == claimAmount as Uint<128>, "Claim must match pending deposit");
+    assert(tokenType(fTokenDomain(coinColor), kernel.self()) == fTokenColor, "Unexpected fToken color");
+
+    mintShieldedToken(
+        fTokenDomain(coinColor),
+        claimAmount,
+        mintNonce(),
+        left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey())
+    );
+
+    mintCounter.increment(1);
+    pendingDeposits.remove(key);
+
+    const previousSupply = suppliedBalances.member(key)
+    ? suppliedBalances.lookup(key)
+    : 0;
+    const updatedSupply = (previousSupply + (claimAmount as Uint<128>)) as Uint<128>;
+    suppliedBalances.insert(key, updatedSupply);
+
+    const commitment = supplyCommitment(coinColor, updatedSupply);
+    if (supplyIndexes.member(key)) {
+        supplyCommitments.insertHashIndex(commitment, supplyIndexes.lookup(key));
+    } else {
+        supplyCommitments.insertHash(commitment);
+        supplyIndexes.insert(key, 0);
+    }
+}
+
+export circuit borrowRepro(
+    loanCoinType_: Bytes<32>,
+    collateralCoin_: ShieldedCoinInfo,
+    amountToBorrow_: Uint<128>
+): [] {
+    const loanCoinType = disclose(loanCoinType_);
+    const disclosedCollateral = disclose(collateralCoin_);
+    const amountToBorrow = disclose(amountToBorrow_);
+    const key = pendingKey(loanCoinType);
+
+    assert(loanCoinType == underlyingColor, "Unexpected loan coin color");
+    assert(disclosedCollateral.color == loanCoinType, "Collateral and loan use same coin color in this repro");
+    assert(amountToBorrow > 0, "Invalid borrow amount");
+
+    receiveIntoProtocolTVL(disclosedCollateral);
+
+    const previousBorrow = borrowedBalances.member(key)
+    ? borrowedBalances.lookup(key)
+    : 0;
+    borrowedBalances.insert(key, (previousBorrow + amountToBorrow) as Uint<128>);
+
+    sendFromProtocolTVL(loanCoinType, ownPublicKey(), amountToBorrow);
+}
+
+export circuit withdrawRepro(
+    lpTokenCoin_: ShieldedCoinInfo,
+    principalCoinType_: Bytes<32>
+): [] {
+    const disclosedLpToken = disclose(lpTokenCoin_);
+    const coinColor = disclose(principalCoinType_);
+    const burnAmount = disclosedLpToken.value;
+    const key = pendingKey(coinColor);
+
+    assert(coinColor == underlyingColor, "Unexpected withdrawal coin color");
+    assert(disclosedLpToken.color == fTokenColor, "Invalid LP token color");
+    assert(suppliedBalances.member(key), "No supplied balance");
+    assert(supplyIndexes.member(key), "No supply commitment index");
+    assert(burnAmount > 0, "Invalid burn amount");
+    assert(burnAmount <= suppliedBalances.lookup(key), "Insufficient supplied balance");
+
+    receiveShielded(disclosedLpToken);
+    sendImmediateShielded(disclosedLpToken, shieldedBurnAddress(), burnAmount);
+
+    const remainingSupply = (suppliedBalances.lookup(key) - burnAmount) as Uint<128>;
+    if (remainingSupply > 0) {
+        suppliedBalances.insert(key, remainingSupply);
+        supplyCommitments.insertHashIndex(supplyCommitment(coinColor, remainingSupply), supplyIndexes.lookup(key));
+    } else {
+        suppliedBalances.remove(key);
+        supplyCommitments.insertHashIndex(supplyCommitment(coinColor, 0), supplyIndexes.lookup(key));
+        supplyIndexes.remove(key);
+    }
+
+    sendFromProtocolTVL(coinColor, ownPublicKey(), burnAmount);
+}

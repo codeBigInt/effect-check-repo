@@ -1,0 +1,52 @@
+{
+  "name": "effects-check-repro-contract",
+  "version": "0.1.0",
+  "description": "Minimal Midnight Compact repro for EffectsCheckFailure custom 186 with shielded receive/send patterns.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "license": "MIT",
+  "types": "./dist/index.d.ts",
+  "packageManager": "yarn@1.22.22",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@midnight-ntwrk/compact-js": "2.5.0",
+    "@midnight-ntwrk/compact-runtime": "0.16.0",
+    "@midnight-ntwrk/ledger-v8": "8.0.3",
+    "@midnight-ntwrk/midnight-js-compact": "4.0.4",
+    "@midnight-ntwrk/midnight-js-http-client-proof-provider": "4.0.4",
+    "@midnight-ntwrk/midnight-js-indexer-public-data-provider": "4.0.4",
+    "@midnight-ntwrk/midnight-js-level-private-state-provider": "4.0.4",
+    "@midnight-ntwrk/midnight-js-network-id": "4.0.4",
+    "@midnight-ntwrk/midnight-js-node-zk-config-provider": "4.0.4",
+    "@midnight-ntwrk/midnight-js-types": "4.0.4",
+    "@midnight-ntwrk/midnight-js-utils": "4.0.4",
+    "@midnight-ntwrk/wallet-sdk-abstractions": "4.0.0",
+    "@midnight-ntwrk/wallet-sdk-dust-wallet": "4.0.0",
+    "@midnight-ntwrk/wallet-sdk-facade": "4.0.0",
+    "@midnight-ntwrk/wallet-sdk-hd": "3.0.2",
+    "@midnight-ntwrk/wallet-sdk-shielded": "3.0.0",
+    "@midnight-ntwrk/wallet-sdk-unshielded-wallet": "3.0.0",
+    "nite-api": "0.0.16",
+    "rxjs": "7.8.2"
+  },
+  "scripts": {
+    "compact": "compact compile src/repro.compact ./src/managed/repro",
+    "compact-test": "compact compile --skip-zk src/repro.compact ./src/managed/repro",
+    "build": "yarn compact-test && rm -rf dist && tsc --project tsconfig.build.json && cp -Rf ./src/managed ./dist/managed && cp ./src/repro.compact ./dist",
+    "cli": "node --experimental-specifier-resolution=node dist/cli.js",
+    "test:standalone": "yarn build && node --experimental-specifier-resolution=node dist/cli.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^25.7.0",
+    "typescript": "^6.0.3"
+  }
+}
