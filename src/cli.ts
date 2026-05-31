@@ -1,27 +1,38 @@
 import { Buffer } from "node:buffer";
+import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { toHex, type ContractState } from "@midnight-ntwrk/compact-runtime";
+import { rawTokenType, toHex, type ContractState } from "@midnight-ntwrk/compact-runtime";
 import {
   createShieldedCoinInfo,
+  communicationCommitmentRandomness,
+  ContractCallPrototype,
+  ContractState as LedgerContractState,
   decodeRawTokenType,
   encodeRawTokenType,
   encodeShieldedCoinInfo,
+  Intent,
   nativeToken,
+  Transaction,
   DustSecretKey,
   LedgerParameters,
+  ZswapOffer,
+  ZswapOutput,
   ZswapSecretKeys,
   type CoinPublicKey,
   type EncPublicKey,
   type FinalizedTransaction,
+  type ShieldedCoinInfo as LedgerShieldedCoinInfo,
 } from "@midnight-ntwrk/ledger-v8";
 import { indexerPublicDataProvider } from "@midnight-ntwrk/midnight-js-indexer-public-data-provider";
 import { levelPrivateStateProvider } from "@midnight-ntwrk/midnight-js-level-private-state-provider";
 import { NodeZkConfigProvider } from "@midnight-ntwrk/midnight-js-node-zk-config-provider";
 import { httpClientProofProvider } from "@midnight-ntwrk/midnight-js-http-client-proof-provider";
-import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
-import { type MidnightProvider, type UnboundTransaction, type WalletProvider } from "@midnight-ntwrk/midnight-js-types";
+import { getNetworkId, setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
+import { SucceedEntirely, type MidnightProvider, type UnboundTransaction, type WalletProvider } from "@midnight-ntwrk/midnight-js-types";
 import { ttlOneHour } from "@midnight-ntwrk/midnight-js-utils";
+import { createUnprovenCallTx, submitTx } from "@midnight-ntwrk/midnight-js-contracts";
+import { Contract as CompactContract } from "@midnight-ntwrk/compact-js";
 import { InMemoryTransactionHistoryStorage } from "@midnight-ntwrk/wallet-sdk-abstractions";
 import {
   WalletEntrySchema,
@@ -37,8 +48,43 @@ import { DynamicContractAPI, type DynamicProviders } from "nite-api";
 import * as Rx from "rxjs";
 import { compiledEffectsCheckReproContract, CompiledEffectsCheckReproContract } from "./index.js";
 import type { Contract, Ledger, ShieldedCoinInfo } from "./managed/repro/contract/index.js";
+import * as dotenv from "dotenv";
+
+dotenv.config();
 
 type ReproPrivateStateId = "repro_ps";
+
+type WalletCache = {
+  savedAt: string;
+  shielded: string;
+  unshielded: string;
+  dust: string;
+};
+
+const walletCachePath = (network: string): string =>
+  path.join(WALLET_CACHE_DIR, `cli-wallet-state-${network}.json`);
+
+const loadWalletCache = async (network: string): Promise<WalletCache | null> => {
+  try {
+    const data = await fs.readFile(walletCachePath(network), "utf-8");
+    return JSON.parse(data) as WalletCache;
+  } catch {
+    return null;
+  }
+};
+
+const saveWalletCache = async (wallet: WalletFacade, network: string): Promise<void> => {
+  const [shielded, unshielded, dust] = await Promise.all([
+    wallet.shielded.serializeState(),
+    wallet.unshielded.serializeState(),
+    wallet.dust.serializeState(),
+  ]);
+  await fs.mkdir(WALLET_CACHE_DIR, { recursive: true });
+  await fs.writeFile(
+    walletCachePath(network),
+    JSON.stringify({ savedAt: new Date().toISOString(), shielded, unshielded, dust } satisfies WalletCache, null, 2),
+  );
+};
 
 type EnvironmentConfiguration = {
   walletNetworkId: "undeployed" | "preview";
@@ -51,9 +97,10 @@ type EnvironmentConfiguration = {
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(currentDir, "..");
+const WALLET_CACHE_DIR = path.resolve(repoRoot, ".wallet-cache");
 const NATIVE_COIN_COLOR = encodeRawTokenType(nativeToken().raw);
 const SCALE_FACTOR = 1_000_000n;
-const DEFAULT_WALLET_SEED = "0000000000000000000000000000000000000000000000000000000000000001";
+const DEFAULT_WALLET_SEED = "823ab960ab282a7163c1183ef2bb99fbecb250707a06665fda35d2e7e1a11fcc";
 
 const logger = {
   info: (...args: unknown[]) => console.log(...args),
@@ -70,15 +117,46 @@ const requireEnv = (name: string): string => {
   return value;
 };
 
+const pad = (value: string, length: number): Uint8Array => {
+  const encoded = new TextEncoder().encode(value);
+  const result = new Uint8Array(length);
+  result.set(encoded.subarray(0, length));
+  return result;
+};
+
+const getTokenMintContractAddress = (): string => {
+  const tokenMintContractAddress = process.env.TOKEN_MINT_CONTRACT_ADDRESS?.trim();
+  if (!tokenMintContractAddress) {
+    throw new Error("TOKEN_MINT_CONTRACT_ADDRESS is required on preview to derive the shielded token color.");
+  }
+  return tokenMintContractAddress.slice(0, 64);
+};
+
+const coinColorFromTokenMintAddress = (contractAddress: string): Uint8Array => {
+  const color = encodeRawTokenType(
+    rawTokenType(
+      pad("ftlending:token-mint", 32),
+      contractAddress.slice(0, 64),
+    ),
+  );
+  console.log(`Shielded Coin Color Reconstructed ${toHex(color)}`);
+  return color;
+};
+
+const getDefaultPoolCoinColor = (env: EnvironmentConfiguration): Uint8Array =>
+  env.networkId === "preview"
+    ? coinColorFromTokenMintAddress(getTokenMintContractAddress())
+    : NATIVE_COIN_COLOR;
+
 const envFromProcess = (): EnvironmentConfiguration => {
   const network = (process.env.NETWORK_ID ?? "undeployed") as "undeployed" | "preview";
   if (network === "preview") {
     return {
       walletNetworkId: "preview",
       networkId: "preview",
-      indexer: process.env.INDEXER_URL ?? "https://indexer.preview.midnight.network/api/v4/graphql",
-      indexerWS: process.env.INDEXER_WS_URL ?? "wss://indexer.preview.midnight.network/api/v4/graphql/ws",
-      nodeWS: process.env.NODE_WS_URL ?? "wss://rpc.preview.midnight.network",
+      indexer: "https://indexer.preview.midnight.network/api/v4/graphql",
+      indexerWS: "wss://indexer.preview.midnight.network/api/v4/graphql/ws",
+      nodeWS: "wss://rpc.preview.midnight.network",
       proofServer: requireEnv("PROOF_SERVER_URL"),
     };
   }
@@ -125,18 +203,24 @@ class ReproWalletProvider implements MidnightProvider, WalletProvider {
     readonly wallet: WalletFacade,
     readonly zswapSecretKeys: ZswapSecretKeys,
     readonly dustSecretKey: DustSecretKey,
-    private readonly unshieldedKeystore: ReturnType<typeof createKeystore>,
+    readonly unshieldedKeystore: ReturnType<typeof createKeystore>,
   ) {}
 
-  static async build(env: EnvironmentConfiguration, seed = DEFAULT_WALLET_SEED): Promise<ReproWalletProvider> {
+  static async build(env: EnvironmentConfiguration, seed = DEFAULT_WALLET_SEED, cache?: WalletCache): Promise<ReproWalletProvider> {
     const shieldedSeed = deriveKeyForRole(seed, Roles.Zswap);
     const unshieldedSeed = deriveKeyForRole(seed, Roles.NightExternal);
     const dustSeed = deriveKeyForRole(seed, Roles.Dust);
     const keystore = createKeystore(unshieldedSeed, env.walletNetworkId);
     const config = walletConfig(env);
-    const shielded = ShieldedWallet(config as any).startWithSeed(shieldedSeed);
-    const unshielded = UnshieldedWallet(config as any).startWithPublicKey(PublicKey.fromKeyStore(keystore));
-    const dust = DustWallet(config as any).startWithSeed(dustSeed, LedgerParameters.initialParameters().dust);
+    const shielded = cache
+      ? ShieldedWallet(config as any).restore(cache.shielded)
+      : ShieldedWallet(config as any).startWithSeed(shieldedSeed);
+    const unshielded = cache
+      ? UnshieldedWallet(config as any).restore(cache.unshielded)
+      : UnshieldedWallet(config as any).startWithPublicKey(PublicKey.fromKeyStore(keystore));
+    const dust = cache
+      ? DustWallet(config as any).restore(cache.dust)
+      : DustWallet(config as any).startWithSeed(dustSeed, LedgerParameters.initialParameters().dust);
     const wallet = await WalletFacade.init({
       configuration: config,
       shielded: () => shielded,
@@ -159,22 +243,22 @@ class ReproWalletProvider implements MidnightProvider, WalletProvider {
     return this.zswapSecretKeys.encryptionPublicKey;
   }
 
-  async balanceTx(tx: UnboundTransaction, ttl: Date = ttlOneHour()): Promise<FinalizedTransaction> {
+  async balanceTx(tx: UnboundTransaction, ttl: Date = ttlOneHour()): Promise<any> {
     const recipe = await this.wallet.balanceUnboundTransaction(
       tx,
-      { shieldedSecretKeys: this.zswapSecretKeys, dustSecretKey: this.dustSecretKey },
+      { shieldedSecretKeys: this.zswapSecretKeys as any, dustSecretKey: this.dustSecretKey as any },
       { ttl },
     );
     const signedRecipe = await this.wallet.signRecipe(recipe, (payload: Uint8Array) => this.unshieldedKeystore.signData(payload));
     return this.wallet.finalizeRecipe(signedRecipe);
   }
 
-  submitTx(tx: FinalizedTransaction): Promise<string> {
+  submitTx(tx: any): Promise<string> {
     return this.wallet.submitTransaction(tx);
   }
 
   start(): Promise<void> {
-    return this.wallet.start(this.zswapSecretKeys, this.dustSecretKey);
+    return this.wallet.start(this.zswapSecretKeys as any, this.dustSecretKey as any);
   }
 
   stop(): Promise<void> {
@@ -186,16 +270,27 @@ const isProgressStrictlyComplete = (progress: unknown): boolean =>
   typeof (progress as { isStrictlyComplete?: unknown })?.isStrictlyComplete === "function" &&
   ((progress as { isStrictlyComplete: () => boolean }).isStrictlyComplete());
 
+const WALLET_SYNC_TIMEOUT_MS = Number(process.env.WALLET_SYNC_TIMEOUT_MS ?? "120000");
+
 const syncWallet = async (wallet: WalletFacade): Promise<void> => {
   await Rx.firstValueFrom(
     wallet.state().pipe(
       Rx.filter(
         (state: any) =>
+          state.shielded.state.progress.isConnected &&
+          state.unshielded.progress.isConnected &&
+          state.dust.state.progress.isConnected &&
           isProgressStrictlyComplete(state.shielded.state.progress) &&
           isProgressStrictlyComplete(state.unshielded.progress) &&
           isProgressStrictlyComplete(state.dust.state.progress),
       ),
       Rx.take(1),
+      Rx.timeout({
+        first: WALLET_SYNC_TIMEOUT_MS,
+        with: () => {
+          throw new Error(`Wallet sync timed out after ${WALLET_SYNC_TIMEOUT_MS}ms`);
+        },
+      }),
     ),
   );
 };
@@ -253,40 +348,217 @@ const logStep = async <T>(name: string, run: () => Promise<T>): Promise<T> => {
   }
 };
 
+const isNetworkError = (error: unknown): boolean => {
+  const msg = String(error);
+  if (msg.includes("Invalid Transaction") || msg.includes("Custom error")) return false;
+  return (
+    msg.includes("disconnected") ||
+    msg.includes("ServerError") ||
+    msg.includes("Wallet.Other")
+  );
+};
+
+const selectPoolCoinColor = (
+  env: EnvironmentConfiguration,
+  walletState: any,
+  needed: bigint,
+): { coinColor: Uint8Array; balance: bigint; label: string } => {
+  const shieldedBalances = walletState.shielded.balances as Record<string, bigint>;
+  const coinColor = getDefaultPoolCoinColor(env);
+  const coinColorHex = toHex(coinColor);
+  return {
+    coinColor,
+    balance: shieldedBalances[coinColorHex] ?? 0n,
+    label: env.networkId === "preview" ? `token mint ${getTokenMintContractAddress()}` : `native ${coinColorHex}`,
+  };
+};
+
+const ensureShieldedBalance = async (
+  wallet: WalletFacade,
+  coinColor: Uint8Array,
+  needed: bigint,
+): Promise<void> => {
+  await syncWallet(wallet);
+
+  const coinColorHex = toHex(coinColor);
+  const stateBefore = await Rx.firstValueFrom(wallet.state());
+  const shielded = (stateBefore.shielded.balances as Record<string, bigint>)[coinColorHex] ?? 0n;
+  if (shielded >= needed) return;
+  throw new Error(`Need ${needed / SCALE_FACTOR} shielded units of ${coinColorHex} but only have ${shielded / SCALE_FACTOR}`);
+};
+
+const retryStep = async <T>(
+  wallet: WalletFacade,
+  name: string,
+  fn: () => Promise<T>,
+  maxAttempts = 3,
+): Promise<T> => {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await logStep(name, fn);
+    } catch (error) {
+      if (attempt >= maxAttempts || !isNetworkError(error)) throw error;
+      const delaySec = attempt * 3;
+      console.warn(`Network error on "${name}", resyncing and retrying in ${delaySec}s (attempt ${attempt}/${maxAttempts})...`);
+      await new Promise<void>((r) => setTimeout(r, delaySec * 1000));
+      await syncWallet(wallet);
+    }
+  }
+  throw new Error("unreachable");
+};
+
+const zswapOutputsToFallibleOffer = (
+  outputs: Array<{
+    coinInfo: LedgerShieldedCoinInfo;
+    recipient: { is_left: boolean; left: string; right: string };
+  }>,
+  walletEncryptionPublicKey: string,
+) => {
+  const offers = outputs.map((output) => {
+    const zswapOutput = output.recipient.is_left
+      ? ZswapOutput.new(output.coinInfo, 0, output.recipient.left, walletEncryptionPublicKey)
+      : ZswapOutput.newContractOwned(output.coinInfo, 0, output.recipient.right);
+    return ZswapOffer.fromOutput(zswapOutput);
+  });
+
+  if (offers.length === 0) return undefined;
+  return offers.reduce((acc, offer) => acc.merge(offer));
+};
+
+const submitFallibleShieldedMintCall = async (
+  api: Awaited<ReturnType<typeof DynamicContractAPI.deploy<Contract, ReproPrivateStateId>>>,
+  circuitId: CompactContract.ProvableCircuitId<Contract>,
+  args: CompactContract.CircuitParameters<Contract, typeof circuitId>,
+) => {
+  const contractAddress = api.deployedContractAddress;
+  const currentState = await api.providers.publicDataProvider.queryContractState(contractAddress);
+  if (currentState == null) throw new Error(`Unable to read contract state for ${contractAddress}.`);
+
+  api.providers.privateStateProvider.setContractAddress(contractAddress);
+  const privateState = await api.providers.privateStateProvider.get("repro_ps");
+  if (privateState == null) {
+    await api.providers.privateStateProvider.set("repro_ps", {} as never);
+  }
+
+  const callData = await createUnprovenCallTx(api.providers, {
+    compiledContract: compiledEffectsCheckReproContract,
+    contractAddress,
+    circuitId,
+    privateStateId: "repro_ps",
+    args,
+  } as never);
+
+  const fallibleTranscript = callData.public.partitionedTranscript[1];
+  if (fallibleTranscript == null) throw new Error(`${String(circuitId)} did not produce a fallible transcript.`);
+
+  const fallibleOffer = zswapOutputsToFallibleOffer(
+    callData.private.nextZswapLocalState.outputs as never,
+    api.providers.walletProvider.getEncryptionPublicKey(),
+  );
+
+  const operation = LedgerContractState.deserialize(currentState.serialize()).operation(circuitId);
+  if (operation == null) throw new Error(`Missing operation for circuit ${String(circuitId)}.`);
+
+  const intent = Intent.new(ttlOneHour()).addCall(
+    new ContractCallPrototype(
+      contractAddress,
+      circuitId,
+      operation,
+      callData.public.partitionedTranscript[0],
+      fallibleTranscript,
+      callData.private.privateTranscriptOutputs,
+      callData.private.input,
+      callData.private.output,
+      communicationCommitmentRandomness(),
+      circuitId,
+    ),
+  );
+  const unprovenTx = Transaction.fromPartsRandomized(getNetworkId(), undefined, fallibleOffer, intent);
+  const finalized = await submitTx(api.providers, { unprovenTx, circuitId });
+  if (finalized.status !== SucceedEntirely) {
+    throw new Error(`${String(circuitId)} transaction failed with status ${finalized.status}.`);
+  }
+
+  await api.providers.privateStateProvider.set(
+    "repro_ps",
+    callData.private.nextPrivateState as never,
+  );
+
+  return {
+    private: callData.private,
+    public: {
+      ...callData.public,
+      ...finalized,
+    },
+  };
+};
+
 const run = async (): Promise<void> => {
   const env = envFromProcess();
   setNetworkId(env.networkId);
-  const walletProvider = await ReproWalletProvider.build(env, process.env.WALLET_SEED ?? DEFAULT_WALLET_SEED);
+  const cache = await loadWalletCache(env.networkId);
+  if (cache) console.log(`Restoring wallet from cache (saved ${cache.savedAt})`);
+  const walletProvider = await ReproWalletProvider.build(env, process.env.WALLET_SEED ?? DEFAULT_WALLET_SEED, cache ?? undefined);
   await walletProvider.start();
   try {
     await syncWallet(walletProvider.wallet);
+    await saveWalletCache(walletProvider.wallet, env.networkId);
+
+    const walletState = await Rx.firstValueFrom(walletProvider.wallet.state());
+    const shieldedNative = (walletState.shielded.balances as Record<string, bigint>)[toHex(NATIVE_COIN_COLOR)] ?? 0n;
+    const unshieldedNative = (walletState.unshielded.balances as Record<string, bigint>)[toHex(NATIVE_COIN_COLOR)] ?? 0n;
+    const dustBalance = walletState.dust.balance(new Date());
+    console.log(`Wallet balances — shielded: ${shieldedNative / SCALE_FACTOR} tMAINE  unshielded: ${unshieldedNative / SCALE_FACTOR} tMAINE  dust: ${dustBalance}`);
+
+    const neededShieldedBalance = 50n * SCALE_FACTOR;
+    const selectedPoolCoin = selectPoolCoinColor(env, walletState, neededShieldedBalance);
+    console.log(`poolCoinColor=${toHex(selectedPoolCoin.coinColor)} (${selectedPoolCoin.label}, shielded balance: ${selectedPoolCoin.balance / SCALE_FACTOR})`);
+
+    await retryStep(walletProvider.wallet, "checkShieldedFunds", () =>
+      ensureShieldedBalance(walletProvider.wallet, selectedPoolCoin.coinColor, neededShieldedBalance),
+    );
+    await saveWalletCache(walletProvider.wallet, env.networkId);
+
     const providers = configureProviders(env, walletProvider);
-    const api = await logStep("deploy", () =>
+    const api = await retryStep(walletProvider.wallet, "deploy", () =>
       DynamicContractAPI.deploy<Contract, ReproPrivateStateId>({
         providers,
-        compiledContract: compiledEffectsCheckReproContract,
+        compiledContract: compiledEffectsCheckReproContract as any,
         logger: logger as never,
       }),
     ) as Awaited<ReturnType<typeof DynamicContractAPI.deploy<Contract, ReproPrivateStateId>>>;
     console.log(`contractAddress=${api.deployedContractAddress}`);
 
-    await logStep("setupPool", () => api.deployedContract.callTx.setupPool(NATIVE_COIN_COLOR));
+    await logStep("setupPool", () => api.deployedContract.callTx.setupPool(selectedPoolCoin.coinColor));
     await syncWallet(walletProvider.wallet);
-    await logStep("depositLiquidity", () => api.deployedContract.callTx.depositLiquidity(shieldedCoin("20")));
+    await logStep("depositLiquidity", () => api.deployedContract.callTx.depositLiquidity(shieldedCoin("20", selectedPoolCoin.coinColor)));
     await syncWallet(walletProvider.wallet);
-    await logStep("claimLpTokens", () => api.deployedContract.callTx.claimLpTokens(NATIVE_COIN_COLOR, 20_000_000n));
+    await logStep("claimLpTokens", () =>
+      submitFallibleShieldedMintCall(api, "mintTokens", [selectedPoolCoin.coinColor, 20_000_000n] as never),
+    );
     await syncWallet(walletProvider.wallet);
 
     const afterClaim = await readLedger(api.deployedContractAddress, providers);
-    console.log(`nativeColor=${toHex(NATIVE_COIN_COLOR)}`);
-    console.log(`fTokenColor=${toHex(afterClaim.fTokenColor)}`);
+    console.log(`underlyingColor=${toHex(selectedPoolCoin.coinColor)}`);
+    console.log(`tokenColor=${toHex(afterClaim.tokenColor)}`);
 
     await logStep("borrowRepro", () =>
-      api.deployedContract.callTx.borrowRepro(NATIVE_COIN_COLOR, shieldedCoin("4"), 3_000_000n),
+      api.deployedContract.callTx.borrowRepro(selectedPoolCoin.coinColor, shieldedCoin("4", selectedPoolCoin.coinColor), 3_000_000n),
+    );
+    await syncWallet(walletProvider.wallet);
+
+    const afterBorrow = await readLedger(api.deployedContractAddress, providers);
+    const borrowEntry = [...afterBorrow.borrowedBalances][0];
+    if (!borrowEntry) throw new Error("No borrow position found after borrowRepro");
+    const [positionKey] = borrowEntry;
+    console.log(`positionKey=${toHex(positionKey)}`);
+
+    await logStep("liquidationRepro", () =>
+      api.deployedContract.callTx.liquidationRepro(positionKey, selectedPoolCoin.coinColor, shieldedCoin("3", selectedPoolCoin.coinColor)),
     );
     await syncWallet(walletProvider.wallet);
     await logStep("withdrawRepro", () =>
-      api.deployedContract.callTx.withdrawRepro(shieldedCoin("10", afterClaim.fTokenColor), NATIVE_COIN_COLOR),
+      api.deployedContract.callTx.withdrawRepro(shieldedCoin("10", afterClaim.tokenColor), selectedPoolCoin.coinColor),
     );
     await syncWallet(walletProvider.wallet);
     console.log("\nRepro flow completed without node rejection.");

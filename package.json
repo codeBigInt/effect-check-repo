@@ -28,19 +28,20 @@
     "@midnight-ntwrk/midnight-js-node-zk-config-provider": "4.0.4",
     "@midnight-ntwrk/midnight-js-types": "4.0.4",
     "@midnight-ntwrk/midnight-js-utils": "4.0.4",
-    "@midnight-ntwrk/wallet-sdk-abstractions": "4.0.0",
+    "@midnight-ntwrk/wallet-sdk-abstractions": "2.1.0",
     "@midnight-ntwrk/wallet-sdk-dust-wallet": "4.0.0",
     "@midnight-ntwrk/wallet-sdk-facade": "4.0.0",
     "@midnight-ntwrk/wallet-sdk-hd": "3.0.2",
     "@midnight-ntwrk/wallet-sdk-shielded": "3.0.0",
     "@midnight-ntwrk/wallet-sdk-unshielded-wallet": "3.0.0",
+    "dotenv": "^17.4.2",
     "nite-api": "0.0.16",
     "rxjs": "7.8.2"
   },
   "scripts": {
     "compact": "compact compile src/repro.compact ./src/managed/repro",
     "compact-test": "compact compile --skip-zk src/repro.compact ./src/managed/repro",
-    "build": "yarn compact-test && rm -rf dist && tsc --project tsconfig.build.json && cp -Rf ./src/managed ./dist/managed && cp ./src/repro.compact ./dist",
+    "build": "rm -rf dist && tsc --project tsconfig.build.json && cp -Rf ./src/managed ./dist/managed && cp ./src/repro.compact ./dist",
     "cli": "node --experimental-specifier-resolution=node dist/cli.js",
     "test:standalone": "yarn build && node --experimental-specifier-resolution=node dist/cli.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"

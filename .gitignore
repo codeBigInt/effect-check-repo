@@ -3,3 +3,4 @@ node_modules
 src/managed
 .env
 .DS_Store
+midnight-level-db

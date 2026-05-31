@@ -6,9 +6,10 @@ export ledger pendingDeposits: Map<Bytes<32>, Uint<128>>;
 export ledger suppliedBalances: Map<Bytes<32>, Uint<128>>;
 export ledger supplyIndexes: Map<Bytes<32>, Uint<64>>;
 export ledger borrowedBalances: Map<Bytes<32>, Uint<128>>;
+export ledger collateralBalances: Map<Bytes<32>, Uint<128>>;
 export ledger supplyCommitments: HistoricMerkleTree<32, Bytes<32>>;
 export ledger underlyingColor: Bytes<32>;
-export ledger fTokenColor: Bytes<32>;
+export ledger tokenColor: Bytes<32>;
 export ledger mintCounter: Counter;
 
 export struct SupplyCommitment {
@@ -47,7 +48,7 @@ circuit supplyCommitment(coinColor: Bytes<32>, amount: Uint<128>): Bytes<32> {
     );
 }
 
-circuit fTokenDomain(coinColor: Bytes<32>): Bytes<32> {
+circuit tokenDomain(coinColor: Bytes<32>): Bytes<32> {
     return persistentHash<Vector<2, Bytes<32>>>([
         pad(32, "effects-check-repro:ftoken"),
         coinColor
@@ -104,7 +105,7 @@ circuit sendFromProtocolTVL(
 export circuit setupPool(coinColor_: Bytes<32>): [] {
     const coinColor = disclose(coinColor_);
     underlyingColor = coinColor;
-    fTokenColor = tokenType(fTokenDomain(coinColor), kernel.self());
+    tokenColor = tokenType(tokenDomain(coinColor), kernel.self());
 }
 
 export circuit depositLiquidity(principalCoin_: ShieldedCoinInfo): [] {
@@ -124,7 +125,7 @@ export circuit depositLiquidity(principalCoin_: ShieldedCoinInfo): [] {
     pendingDeposits.insert(key, (previousAmount + depositAmount) as Uint<128>);
 }
 
-export circuit claimLpTokens(coinColor_: Bytes<32>, claimAmount_: Uint<64>): [] {
+export circuit mintTokens(coinColor_: Bytes<32>, claimAmount_: Uint<64>): [] {
     const coinColor = disclose(coinColor_);
     const claimAmount = disclose(claimAmount_);
     const key = pendingKey(coinColor);
@@ -132,10 +133,10 @@ export circuit claimLpTokens(coinColor_: Bytes<32>, claimAmount_: Uint<64>): [] 
     assert(coinColor == underlyingColor, "Unexpected claim coin color");
     assert(pendingDeposits.member(key), "No pending deposit");
     assert(pendingDeposits.lookup(key) == claimAmount as Uint<128>, "Claim must match pending deposit");
-    assert(tokenType(fTokenDomain(coinColor), kernel.self()) == fTokenColor, "Unexpected fToken color");
+    assert(tokenType(tokenDomain(coinColor), kernel.self()) == tokenColor, "Unexpected fToken color");
 
     mintShieldedToken(
-        fTokenDomain(coinColor),
+        tokenDomain(coinColor),
         claimAmount,
         mintNonce(),
         left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey())
@@ -180,7 +181,36 @@ export circuit borrowRepro(
     : 0;
     borrowedBalances.insert(key, (previousBorrow + amountToBorrow) as Uint<128>);
 
+    const previousCollateral = collateralBalances.member(key)
+    ? collateralBalances.lookup(key)
+    : 0;
+    collateralBalances.insert(key, (previousCollateral + disclosedCollateral.value) as Uint<128>);
+
     sendFromProtocolTVL(loanCoinType, ownPublicKey(), amountToBorrow);
+}
+
+export circuit liquidationRepro(
+    positionKey_: Bytes<32>,
+    loanCoinType_: Bytes<32>,
+    repaymentCoin_: ShieldedCoinInfo
+): [] {
+    const positionKey = disclose(positionKey_);
+    const loanCoinType = disclose(loanCoinType_);
+    const repaymentCoin = disclose(repaymentCoin_);
+
+    assert(loanCoinType == underlyingColor, "Unexpected loan coin color");
+    assert(repaymentCoin.color == loanCoinType, "Repayment coin color mismatch");
+    assert(borrowedBalances.member(positionKey), "No borrowed balance to liquidate");
+    assert(collateralBalances.member(positionKey), "No collateral to seize");
+
+    receiveIntoProtocolTVL(repaymentCoin);
+
+    const collateralAmount = collateralBalances.lookup(positionKey);
+
+    sendFromProtocolTVL(loanCoinType, ownPublicKey(), collateralAmount);
+
+    borrowedBalances.remove(positionKey);
+    collateralBalances.remove(positionKey);
 }
 
 export circuit withdrawRepro(
@@ -193,7 +223,7 @@ export circuit withdrawRepro(
     const key = pendingKey(coinColor);
 
     assert(coinColor == underlyingColor, "Unexpected withdrawal coin color");
-    assert(disclosedLpToken.color == fTokenColor, "Invalid LP token color");
+    assert(disclosedLpToken.color == tokenColor, "Invalid LP token color");
     assert(suppliedBalances.member(key), "No supplied balance");
     assert(supplyIndexes.member(key), "No supply commitment index");
     assert(burnAmount > 0, "Invalid burn amount");
