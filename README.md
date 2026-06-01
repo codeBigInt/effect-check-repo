@@ -11,7 +11,7 @@ Transactions that combine `receiveShielded` + `sendShielded` (or `receiveShielde
 | ledger-v8 version | Affected circuits |
 |---|---|
 | 8.0.1 | `borrowRepro`, `withdrawRepro`, `liquidationRepro` |
-| 8.1.0 | **All circuits** — including `depositLiquidity` and `claimLpTokens`, which do not send shielded coins |
+| 8.1.0 | **All circuits** — including `depositLiquidity` and `mintTokens`, which do not send shielded coins |
 
 On `8.1.0` the failure is broader: even circuits that only call `receiveShielded` without any outgoing `sendShielded` are rejected. This means circuits that previously worked under `8.0.1` now fail under `8.1.0`.
 
@@ -34,7 +34,7 @@ The patterns exercised:
 
 - `setupPool(coinColor)` — stores the underlying token color and derives the LP token color.
 - `depositLiquidity(principalCoin)` — receives underlying coin into `protocolTVL`.
-- `claimLpTokens(coinColor, claimAmount)` — mints a shielded LP token and inserts a supply commitment into `supplyCommitments`.
+- `mintTokens(coinColor, claimAmount)` — mints a shielded LP token and inserts a supply commitment into `supplyCommitments`.
 - `borrowRepro(loanCoinType, collateralCoin, amountToBorrow)` — receives collateral into `protocolTVL`, records borrow and collateral state, then sends loan tokens from `protocolTVL` to the caller.
 - `liquidationRepro(positionKey, loanCoinType)` — reads collateral amount for a position key, sends seized collateral from `protocolTVL` to the caller, and clears the position from `borrowedBalances` and `collateralBalances`.
 - `withdrawRepro(lpTokenCoin, principalCoinType)` — receives and burns the LP token, rewrites the supply commitment with `insertHashIndex`, then sends underlying tokens from `protocolTVL` to the caller.
@@ -47,20 +47,20 @@ Use native token color (`0x00...00`) for the shortest path. Expected result on a
 
 1. `setupPool(nativeColor)`
 2. `depositLiquidity(nativeShieldedCoin(20))`
-3. `claimLpTokens(nativeColor, 20_000_000)`
+3. `mintTokens(nativeColor, 20_000_000)`
 
 **Borrow path** (fails on both 8.0.1 and 8.1.0):
 
 1. `setupPool(nativeColor)`
 2. `depositLiquidity(nativeShieldedCoin(20))`
-3. `claimLpTokens(nativeColor, 20_000_000)`
+3. `mintTokens(nativeColor, 20_000_000)`
 4. `borrowRepro(nativeColor, nativeShieldedCoin(4), 3_000_000)`
 
 **Liquidation path** (fails on both 8.0.1 and 8.1.0):
 
 1. `setupPool(nativeColor)`
 2. `depositLiquidity(nativeShieldedCoin(20))`
-3. `claimLpTokens(nativeColor, 20_000_000)`
+3. `mintTokens(nativeColor, 20_000_000)`
 4. `borrowRepro(nativeColor, nativeShieldedCoin(4), 3_000_000)`
 5. Read `positionKey` from `borrowedBalances` ledger map
 6. `liquidationRepro(positionKey, nativeColor)`
@@ -69,7 +69,7 @@ Use native token color (`0x00...00`) for the shortest path. Expected result on a
 
 1. `setupPool(nativeColor)`
 2. `depositLiquidity(nativeShieldedCoin(20))`
-3. `claimLpTokens(nativeColor, 20_000_000)`
+3. `mintTokens(nativeColor, 20_000_000)`
 4. `withdrawRepro(lpShieldedCoin(10), nativeColor)`
 
 ## Local Build
@@ -96,7 +96,7 @@ yarn compact
 
 The CLI deploys the contract and runs the full repro sequence:
 
-`setupPool → depositLiquidity → claimLpTokens → borrowRepro → liquidationRepro → withdrawRepro`
+`setupPool → depositLiquidity → mintTokens → borrowRepro → liquidationRepro → withdrawRepro`
 
 Set environment variables for the target network, then:
 
