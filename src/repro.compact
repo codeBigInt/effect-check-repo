@@ -7,6 +7,9 @@ export ledger suppliedBalances: Map<Bytes<32>, Uint<128>>;
 export ledger supplyIndexes: Map<Bytes<32>, Uint<64>>;
 export ledger borrowedBalances: Map<Bytes<32>, Uint<128>>;
 export ledger collateralBalances: Map<Bytes<32>, Uint<128>>;
+export ledger pendingBorrows: Map<Bytes<32>, Uint<128>>;
+export ledger pendingWithdrawals: Map<Bytes<32>, Uint<128>>;
+export ledger pendingLiquidations: Map<Bytes<32>, Uint<128>>;
 export ledger supplyCommitments: HistoricMerkleTree<32, Bytes<32>>;
 export ledger underlyingColor: Bytes<32>;
 export ledger tokenColor: Bytes<32>;
@@ -160,7 +163,11 @@ export circuit mintTokens(coinColor_: Bytes<32>, claimAmount_: Uint<64>): [] {
     }
 }
 
-export circuit borrowRepro(
+// FIX: borrow split into two transactions so that no single tx combines
+// receiveShielded with a contract-owned-coin sendShielded.
+// Tx 1 receives the collateral and records the obligation + a pendingBorrows
+// bridge entry. No send.
+export circuit postCollateral(
     loanCoinType_: Bytes<32>,
     collateralCoin_: ShieldedCoinInfo,
     amountToBorrow_: Uint<128>
@@ -186,10 +193,27 @@ export circuit borrowRepro(
     : 0;
     collateralBalances.insert(key, (previousCollateral + disclosedCollateral.value) as Uint<128>);
 
-    sendFromProtocolTVL(loanCoinType, ownPublicKey(), amountToBorrow);
+    pendingBorrows.insert(key, amountToBorrow);
 }
 
-export circuit liquidationRepro(
+// Tx 2 reads the pendingBorrows bridge entry and sends the loan from TVL.
+// No receive in this tx.
+export circuit drawLoan(loanCoinType_: Bytes<32>): [] {
+    const loanCoinType = disclose(loanCoinType_);
+    const key = pendingKey(loanCoinType);
+
+    assert(loanCoinType == underlyingColor, "Unexpected loan coin color");
+    assert(pendingBorrows.member(key), "No pending borrow to draw");
+
+    const amountToSend = pendingBorrows.lookup(key);
+    sendFromProtocolTVL(loanCoinType, ownPublicKey(), amountToSend);
+
+    pendingBorrows.remove(key);
+}
+
+// FIX: liquidation split the same way. Tx 1 receives the repayment into TVL
+// and records the seize amount in pendingLiquidations. No send.
+export circuit repayLoan(
     positionKey_: Bytes<32>,
     loanCoinType_: Bytes<32>,
     repaymentCoin_: ShieldedCoinInfo
@@ -205,15 +229,35 @@ export circuit liquidationRepro(
 
     receiveIntoProtocolTVL(repaymentCoin);
 
-    const collateralAmount = collateralBalances.lookup(positionKey);
+    pendingLiquidations.insert(positionKey, collateralBalances.lookup(positionKey));
+}
 
+// Tx 2 sends the seized collateral from TVL and clears the position.
+// No receive in this tx.
+export circuit seizeCollateral(
+    positionKey_: Bytes<32>,
+    loanCoinType_: Bytes<32>
+): [] {
+    const positionKey = disclose(positionKey_);
+    const loanCoinType = disclose(loanCoinType_);
+
+    assert(loanCoinType == underlyingColor, "Unexpected loan coin color");
+    assert(pendingLiquidations.member(positionKey), "No pending liquidation to seize");
+
+    const collateralAmount = pendingLiquidations.lookup(positionKey);
     sendFromProtocolTVL(loanCoinType, ownPublicKey(), collateralAmount);
 
+    pendingLiquidations.remove(positionKey);
     borrowedBalances.remove(positionKey);
     collateralBalances.remove(positionKey);
 }
 
-export circuit withdrawRepro(
+// FIX: withdraw split. The receive + the LP-token burn stay together in Tx 1
+// (receiveShielded + sendImmediateShielded of a just-received coin co-exist
+// fine; only a contract-owned sendShielded cannot share the tx). Tx 1 also
+// updates the supply commitment and records pendingWithdrawals. No
+// contract-owned send.
+export circuit initiateWithdrawal(
     lpTokenCoin_: ShieldedCoinInfo,
     principalCoinType_: Bytes<32>
 ): [] {
@@ -242,5 +286,20 @@ export circuit withdrawRepro(
         supplyIndexes.remove(key);
     }
 
-    sendFromProtocolTVL(coinColor, ownPublicKey(), burnAmount);
+    pendingWithdrawals.insert(key, burnAmount);
+}
+
+// Tx 2 sends the principal from TVL and clears pendingWithdrawals.
+// No receive in this tx.
+export circuit completeWithdrawal(principalCoinType_: Bytes<32>): [] {
+    const coinColor = disclose(principalCoinType_);
+    const key = pendingKey(coinColor);
+
+    assert(coinColor == underlyingColor, "Unexpected withdrawal coin color");
+    assert(pendingWithdrawals.member(key), "No pending withdrawal to complete");
+
+    const amountToSend = pendingWithdrawals.lookup(key);
+    sendFromProtocolTVL(coinColor, ownPublicKey(), amountToSend);
+
+    pendingWithdrawals.remove(key);
 }
