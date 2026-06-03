@@ -542,23 +542,42 @@ const run = async (): Promise<void> => {
     console.log(`underlyingColor=${toHex(selectedPoolCoin.coinColor)}`);
     console.log(`tokenColor=${toHex(afterClaim.tokenColor)}`);
 
-    await logStep("borrowRepro", () =>
-      api.deployedContract.callTx.borrowRepro(selectedPoolCoin.coinColor, shieldedCoin("4", selectedPoolCoin.coinColor), 3_000_000n),
+    // Borrow is now a two-transaction flow: postCollateral receives the
+    // collateral and records the obligation, drawLoan sends the loan from TVL.
+    await logStep("postCollateral", () =>
+      api.deployedContract.callTx.postCollateral(selectedPoolCoin.coinColor, shieldedCoin("4", selectedPoolCoin.coinColor), 3_000_000n),
+    );
+    await syncWallet(walletProvider.wallet);
+    await logStep("drawLoan", () =>
+      api.deployedContract.callTx.drawLoan(selectedPoolCoin.coinColor),
     );
     await syncWallet(walletProvider.wallet);
 
     const afterBorrow = await readLedger(api.deployedContractAddress, providers);
     const borrowEntry = [...afterBorrow.borrowedBalances][0];
-    if (!borrowEntry) throw new Error("No borrow position found after borrowRepro");
+    if (!borrowEntry) throw new Error("No borrow position found after postCollateral");
     const [positionKey] = borrowEntry;
     console.log(`positionKey=${toHex(positionKey)}`);
 
-    await logStep("liquidationRepro", () =>
-      api.deployedContract.callTx.liquidationRepro(positionKey, selectedPoolCoin.coinColor, shieldedCoin("3", selectedPoolCoin.coinColor)),
+    // Liquidation is now two transactions: repayLoan receives the repayment,
+    // seizeCollateral sends the seized collateral from TVL.
+    await logStep("repayLoan", () =>
+      api.deployedContract.callTx.repayLoan(positionKey, selectedPoolCoin.coinColor, shieldedCoin("3", selectedPoolCoin.coinColor)),
     );
     await syncWallet(walletProvider.wallet);
-    await logStep("withdrawRepro", () =>
-      api.deployedContract.callTx.withdrawRepro(shieldedCoin("10", afterClaim.tokenColor), selectedPoolCoin.coinColor),
+    await logStep("seizeCollateral", () =>
+      api.deployedContract.callTx.seizeCollateral(positionKey, selectedPoolCoin.coinColor),
+    );
+    await syncWallet(walletProvider.wallet);
+
+    // Withdraw is now two transactions: initiateWithdrawal receives and burns
+    // the LP token, completeWithdrawal sends the principal from TVL.
+    await logStep("initiateWithdrawal", () =>
+      api.deployedContract.callTx.initiateWithdrawal(shieldedCoin("10", afterClaim.tokenColor), selectedPoolCoin.coinColor),
+    );
+    await syncWallet(walletProvider.wallet);
+    await logStep("completeWithdrawal", () =>
+      api.deployedContract.callTx.completeWithdrawal(selectedPoolCoin.coinColor),
     );
     await syncWallet(walletProvider.wallet);
     console.log("\nRepro flow completed without node rejection.");
